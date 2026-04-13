@@ -1,0 +1,52 @@
+{
+  "policy_id": "hr_exc_001",
+  "version": "1.0.0",
+  "workflow_scope": "HR_EXCEPTION_OFFER",
+  "effective_date": "2026-01-01T00:00:00Z",
+  "rules": [
+    {
+      "rule_id": "r001",
+      "description": "Business justification must be present",
+      "fact_key": "business_justification",
+      "operator": "exists",
+      "threshold": null,
+      "on_pass": "PASS",
+      "on_fail": "DENY",
+      "rationale_pass": "Business justification provided — required condition satisfied",
+      "rationale_fail": "Business justification missing — hard block; required for all exception offers"
+    },
+    {
+      "rule_id": "r002",
+      "description": "Salary-to-band ratio must not exceed 2.0x band maximum",
+      "fact_key": "salary_to_band_ratio",
+      "operator": "lte",
+      "threshold": 2.0,
+      "on_pass": "PASS",
+      "on_fail": "DENY",
+      "rationale_pass": "Salary within 2.0x band maximum — policy threshold satisfied",
+      "rationale_fail": "Salary exceeds 2.0x band maximum — hard block; requires separate CHRO exception process"
+    },
+    {
+      "rule_id": "r003",
+      "description": "Competing offer documented for salary exceptions above 1.2x band",
+      "fact_key": "competing_offer_documented",
+      "operator": "eq",
+      "threshold": true,
+      "on_pass": "PASS",
+      "on_fail": "WARN",
+      "rationale_pass": "Competing offer documentation present — satisfies evidence requirement",
+      "rationale_fail": "No competing offer documented — required for salary exceptions above 1.2x band; escalation flagged"
+    },
+    {
+      "rule_id": "r004",
+      "description": "Role level must be specified",
+      "fact_key": "role_level",
+      "operator": "exists",
+      "threshold": null,
+      "on_pass": "PASS",
+      "on_fail": "WARN",
+      "rationale_pass": "Role level specified — comp band lookup possible",
+      "rationale_fail": "Role level not specified — comp band verification incomplete; WARN flagged"
+    }
+  ]
+}
