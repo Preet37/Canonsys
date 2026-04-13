@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from .authority import AuthorityMatrixService, AuthorityResolution
+from .database import init_db
+from . import db_store
 from .evidence import EvidenceBuilder, EvidencePacket
 from .ledger import HashChainedLedger
 from .models import (
@@ -72,6 +74,86 @@ class CaseEngine:
 
     def __post_init__(self) -> None:
         self._release_compiler = ReleaseCompiler(self.authority_service)
+        init_db()
+        self._restore_from_db()
+
+    def _persist_event(self, case_id: str, actor: str, event_type: EventType, payload: dict, supersedes_event_id: str | None = None) -> EventRecord:
+        """Append to in-memory ledger and persist to SQLite atomically."""
+        event = self.ledger.append_event(
+            case_id=case_id,
+            actor=actor,
+            event_type=event_type,
+            payload=payload,
+            supersedes_event_id=supersedes_event_id,
+        )
+        db_store.insert_event(event)
+        return event
+
+    def _restore_from_db(self) -> None:
+        """Re-hydrate in-memory state from SQLite on startup."""
+        for case_data in db_store.load_all_case_data(limit=10000):
+            try:
+                case = CaseRecord(**{
+                    **case_data,
+                    'status': CaseState(case_data['status']),
+                    'current_stage': CaseState(case_data.get('current_stage', case_data['status'])),
+                })
+                cid = case.case_id
+                self._cases[cid] = case
+                self._facts[cid] = []
+                self._artifacts[cid] = []
+                self._proposals[cid] = []
+                self._policy_results[cid] = []
+                self._approvals[cid] = []
+
+                # Restore facts
+                for fd in db_store.load_facts(cid):
+                    self._facts[cid].append(FactRecord(**fd))
+
+                # Restore proposals
+                for pd in db_store.load_proposals(cid):
+                    self._proposals[cid].append(ProposalRecord(**pd))
+
+                # Restore policy results
+                for rd in db_store.load_policy_results(cid):
+                    self._policy_results[cid].append(PolicyResultRecord(**rd))
+
+                # Restore approvals
+                for ad in db_store.load_approvals(cid):
+                    self._approvals[cid].append(ApprovalRecord(**ad))
+
+                # Restore release plan
+                rpd = db_store.load_release_plan(cid)
+                if rpd:
+                    self._release_plans[cid] = ReleasePlanRecord(**rpd)
+
+                # Restore token
+                tkd = db_store.load_release_token(cid)
+                if tkd:
+                    token = ReleaseTokenRecord(**tkd)
+                    self._tokens[token.token_id] = token
+                    self._case_token_map[cid] = token.token_id
+
+                # Restore execution result
+                exd = db_store.load_execution(cid)
+                if exd:
+                    self._execution_results[cid] = exd
+
+                # Restore ledger events (rebuild in-memory hash chain)
+                for evd in db_store.load_events(cid):
+                    try:
+                        evt = EventRecord(**{
+                            **evd,
+                            'event_type': EventType(evd['event_type']) if isinstance(evd.get('event_type'), str) else evd['event_type'],
+                        })
+                        bucket = self.ledger._events_by_case[cid]
+                        if not any(e.event_id == evt.event_id for e in bucket):
+                            bucket.append(evt)
+                    except Exception:
+                        continue
+
+            except Exception:
+                continue
 
     # ── Case lifecycle ────────────────────────────────────────────────────────
 
@@ -97,18 +179,14 @@ class CaseEngine:
         self._proposals[case_id] = []
         self._policy_results[case_id] = []
         self._approvals[case_id] = []
+        db_store.upsert_case(case)
 
-        event = self.ledger.append_event(
-            case_id=case_id,
-            actor=actor,
-            event_type=EventType.CASE_CREATED,
-            payload={
-                "case_id": case_id,
-                "status": CaseState.DRAFT.value,
-                "risk_level": request.risk_level.value,
-                "case_type": request.case_type,
-            },
-        )
+        event = self._persist_event(case_id, actor, EventType.CASE_CREATED, {
+            "case_id": case_id,
+            "status": CaseState.DRAFT.value,
+            "risk_level": request.risk_level.value,
+            "case_type": request.case_type,
+        })
         return case, event
 
     def get_case(self, case_id: str) -> CaseRecord:
@@ -131,16 +209,11 @@ class CaseEngine:
         case.status = request.target_state
         case.current_stage = request.target_state
         case.updated_at = now
+        db_store.upsert_case(case)
 
-        event = self.ledger.append_event(
-            case_id=case_id,
-            actor=request.actor,
-            event_type=EventType.STATE_TRANSITION,
-            payload={
-                "from_state": prev.value,
-                "to_state": request.target_state.value,
-                "note": request.note,
-            },
+        event = self._persist_event(
+            case_id, request.actor, EventType.STATE_TRANSITION,
+            {"from_state": prev.value, "to_state": request.target_state.value, "note": request.note},
             supersedes_event_id=request.supersedes_event_id,
         )
         return TransitionResult(case=case, event=event)
@@ -170,12 +243,8 @@ class CaseEngine:
             confidence=confidence,
         )
         self._facts[case_id].append(fact)
-        self.ledger.append_event(
-            case_id=case_id,
-            actor=actor,
-            event_type=EventType.FACT_ADDED,
-            payload={"fact_id": fact.fact_id, "key": key, "source": source},
-        )
+        db_store.upsert_fact(fact)
+        self._persist_event(case_id, actor, EventType.FACT_ADDED, {"fact_id": fact.fact_id, "key": key, "source": source})
         return fact
 
     def list_facts(self, case_id: str) -> list[FactRecord]:
@@ -188,12 +257,8 @@ class CaseEngine:
             if fact.fact_id == fact_id:
                 fact.verified_flag = True
                 fact.verified_by = verified_by
-                self.ledger.append_event(
-                    case_id=case_id,
-                    actor=verified_by,
-                    event_type=EventType.FACT_VERIFIED,
-                    payload={"fact_id": fact_id},
-                )
+                db_store.upsert_fact(fact)
+                self._persist_event(case_id, verified_by, EventType.FACT_VERIFIED, {"fact_id": fact_id})
                 return fact
         raise CaseNotFoundError(f"fact_id:{fact_id}")
 
@@ -221,17 +286,13 @@ class CaseEngine:
             additional_context=additional_context,
         )
         self._proposals[case_id].append(proposal)
-        self.ledger.append_event(
-            case_id=case_id,
-            actor=actor,
-            event_type=EventType.PROPOSAL_GENERATED,
-            payload={
-                "proposal_id": proposal.proposal_id,
-                "model": proposal.model_used,
-                "prompt_version": proposal.prompt_version,
-                "advisory_only": True,
-            },
-        )
+        db_store.insert_proposal(proposal)
+        self._persist_event(case_id, actor, EventType.PROPOSAL_GENERATED, {
+            "proposal_id": proposal.proposal_id,
+            "model": proposal.model_used,
+            "prompt_version": proposal.prompt_version,
+            "advisory_only": True,
+        })
         return proposal
 
     def list_proposals(self, case_id: str) -> list[ProposalRecord]:
@@ -248,12 +309,9 @@ class CaseEngine:
         results = self.policy_engine.evaluate(case_id, case.case_type, facts_dict)
         self._policy_results[case_id] = results
         verdict = self.policy_engine.overall_verdict(results)
-        self.ledger.append_event(
-            case_id=case_id,
-            actor=actor,
-            event_type=EventType.POLICY_EVALUATED,
-            payload={"verdict": verdict, "rule_count": len(results)},
-        )
+        db_store.insert_policy_results(results, case_id)
+        db_store.seal_facts(case_id)  # lock facts at evaluation time
+        self._persist_event(case_id, actor, EventType.POLICY_EVALUATED, {"verdict": verdict, "rule_count": len(results)})
         return results
 
     def get_policy_results(self, case_id: str) -> list[PolicyResultRecord]:
@@ -294,16 +352,10 @@ class CaseEngine:
             timestamp=utc_now(),
         )
         self._approvals[case_id].append(approval)
-        self.ledger.append_event(
-            case_id=case_id,
-            actor=approver,
-            event_type=EventType.APPROVAL_SUBMITTED,
-            payload={
-                "approval_id": approval.approval_id,
-                "decision": decision,
-                "role": role,
-            },
-        )
+        db_store.insert_approval(approval)
+        self._persist_event(case_id, approver, EventType.APPROVAL_SUBMITTED, {
+            "approval_id": approval.approval_id, "decision": decision, "role": role,
+        })
         return approval
 
     def list_approvals(self, case_id: str) -> list[ApprovalRecord]:
@@ -357,23 +409,17 @@ class CaseEngine:
             self._release_plans[case_id] = result.release_plan
             self._tokens[result.release_token.token_id] = result.release_token
             self._case_token_map[case_id] = result.release_token.token_id
-            self.ledger.append_event(
-                case_id=case_id,
-                actor=actor,
-                event_type=EventType.RELEASE_COMPILED,
-                payload={
-                    "release_plan_id": result.release_plan.release_plan_id,
-                    "token_id": result.release_token.token_id,
-                    "allowed": True,
-                },
-            )
+            db_store.upsert_release_plan(result.release_plan)
+            db_store.upsert_release_token(result.release_token, case_id=case_id)
+            self._persist_event(case_id, actor, EventType.RELEASE_COMPILED, {
+                "release_plan_id": result.release_plan.release_plan_id,
+                "token_id": result.release_token.token_id,
+                "allowed": True,
+            })
         else:
-            self.ledger.append_event(
-                case_id=case_id,
-                actor=actor,
-                event_type=EventType.RELEASE_DENIED,
-                payload={"allowed": False, "reasons": result.denial_reasons},
-            )
+            self._persist_event(case_id, actor, EventType.RELEASE_DENIED, {
+                "allowed": False, "reasons": result.denial_reasons,
+            })
         return result
 
     def get_release_plan(self, case_id: str) -> ReleasePlanRecord | None:
@@ -417,16 +463,13 @@ class CaseEngine:
             "token_id": token_id,
         }
         self._execution_results[case_id] = outcome
-        self.ledger.append_event(
-            case_id=case_id,
-            actor=actor,
-            event_type=EventType.EXECUTED,
-            payload={
-                "success": result.success,
-                "artifact_uri": result.artifact_uri,
-                "token_id": token_id,
-            },
-        )
+        db_store.mark_token_used(token_id)
+        db_store.save_execution_dict(case_id, new_id("exec"), outcome)
+        self._persist_event(case_id, actor, EventType.EXECUTED, {
+            "success": result.success,
+            "artifact_uri": result.artifact_uri,
+            "token_id": token_id,
+        })
         return outcome
 
     def get_execution_result(self, case_id: str) -> dict[str, Any] | None:
