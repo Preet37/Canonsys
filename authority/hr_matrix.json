@@ -1,0 +1,37 @@
+{
+  "workflow_scope": "HR_EXCEPTION_OFFER",
+  "entries": [
+    {
+      "case_type": "HR_EXCEPTION_OFFER",
+      "risk_level": "LOW",
+      "required_roles": ["HR_MANAGER"],
+      "self_approval_prohibited": true,
+      "separation_of_duties": [],
+      "escalation_paths": ["HR_DIRECTOR"]
+    },
+    {
+      "case_type": "HR_EXCEPTION_OFFER",
+      "risk_level": "MEDIUM",
+      "required_roles": ["HR_DIRECTOR", "HIRING_VP"],
+      "self_approval_prohibited": true,
+      "separation_of_duties": [["requester", "HR_DIRECTOR"]],
+      "escalation_paths": ["CHRO"]
+    },
+    {
+      "case_type": "HR_EXCEPTION_OFFER",
+      "risk_level": "HIGH",
+      "required_roles": ["VP_ENGINEERING", "HR_DIRECTOR", "FINANCE_VP"],
+      "self_approval_prohibited": true,
+      "separation_of_duties": [["requester", "VP_ENGINEERING"]],
+      "escalation_paths": ["CHRO", "CFO"]
+    },
+    {
+      "case_type": "HR_EXCEPTION_OFFER",
+      "risk_level": "CRITICAL",
+      "required_roles": ["CEO", "CHRO", "CFO", "LEGAL_COUNSEL"],
+      "self_approval_prohibited": true,
+      "separation_of_duties": [["requester", "CEO"]],
+      "escalation_paths": []
+    }
+  ]
+}
